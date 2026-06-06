@@ -79,6 +79,15 @@ CREATE TABLE IF NOT EXISTS calls (
     FOREIGN KEY(slot_id) REFERENCES slots(id)
 );
 
+-- Idempotency dedup store: at-least-once webhook delivery means the same
+-- post-call event can arrive twice. event_key (e.g. "postcall:<call_attempt_id>")
+-- is the PK; INSERT OR IGNORE distinguishes first delivery from a duplicate.
+CREATE TABLE IF NOT EXISTS processed_events (
+    event_key TEXT PRIMARY KEY,
+    kind TEXT,
+    received_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_slots_status ON slots(status);
 CREATE INDEX IF NOT EXISTS idx_calls_fonio ON calls(fonio_call_id);
 """
@@ -90,6 +99,11 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    # Explicit, tuned write-wait: WAL allows concurrent readers, but a second
+    # writer hitting a write lock would otherwise contend. 5000ms makes writers
+    # serialize (block, then proceed) instead of risking a 'database is locked'
+    # error under the two-patients-one-slot race / webhook retries.
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

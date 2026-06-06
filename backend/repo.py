@@ -70,16 +70,107 @@ def cancel_slot(sid: int) -> None:
     set_slot_status(sid, "cancelled")
 
 
-def fill_slot(sid: int, patient_id: int, treatment: str, minutes: int, value: int) -> None:
+def fill_slot(sid: int, patient_id: int, treatment: str, minutes: int, value: int) -> bool:
     """Book a patient into a freed slot for a specific treatment, adopting that
-    treatment's type/duration/value (the freed time becomes their appointment)."""
+    treatment's type/duration/value (the freed time becomes their appointment).
+
+    ATOMIC compare-and-set: only fills a slot still in 'recovering'. Returns True
+    if THIS writer won the slot (rowcount == 1), False if it was already filled by
+    a concurrent winner / a duplicate webhook (rowcount == 0). The caller MUST
+    honour the bool and skip booking/attendance on False — no double-book."""
     with _conn() as c:
-        c.execute(
+        cur = c.execute(
             """UPDATE slots SET status = 'filled', booked_patient_id = ?,
                                 type = ?, duration_min = ?, value_eur = ?
-               WHERE id = ?""",
+               WHERE id = ? AND status = 'recovering'""",
             (patient_id, treatment, minutes, value, sid),
         )
+        return cur.rowcount == 1
+
+
+def try_fill_slot(sid: int, pid: int) -> bool:
+    """Atomic conditional commit (compare-and-set). Only succeeds if the slot is
+    still 'recovering'. The race winner gets True; any second/duplicate writer
+    gets rowcount 0 -> False, so the slot can never be double-booked. This is the
+    booked-commit guard for the two-patients-one-slot race AND for duplicate /
+    out-of-order post-call deliveries.
+
+    NB: the slot is set to 'recovering' at trigger time (orchestrator.trigger_recovery)
+    and stays 'recovering' through the entire dial loop, so this precondition never
+    false-rejects a legitimate first booking.
+    """
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE slots SET status = 'filled', booked_patient_id = :pid "
+            "WHERE id = :sid AND status = 'recovering'",
+            {"pid": pid, "sid": sid},
+        )
+        return cur.rowcount == 1
+
+
+def mark_event_processed(event_key: str, kind: str) -> bool:
+    """Idempotency dedup. INSERT OR IGNORE into processed_events. Returns True if
+    newly inserted (first delivery -> caller should proceed), False if the key was
+    already present (duplicate delivery -> caller should no-op)."""
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT OR IGNORE INTO processed_events(event_key, kind, received_at) "
+            "VALUES (?, ?, ?)",
+            (event_key, kind, datetime.now().isoformat()),
+        )
+        return cur.rowcount == 1
+
+
+def pull_forward_commit(from_slot_id: int, to_slot_id: int, patient_id: int,
+                        treatment: str, minutes: int, value: int) -> bool:
+    """ATOMIC pull-forward: fill the earlier slot (to_slot_id) with the patient and
+    free their later slot (from_slot_id) in ONE transaction, so the move can never
+    leave the patient double-booked (filled into A while still booked in B) and two
+    concurrent recoveries can never both pull the same patient.
+
+    Two compare-and-sets, both of which must succeed inside the SAME txn:
+      1. fill the earlier slot — CAS on status='recovering'. Loses if another
+         recovery already filled A / A is no longer recovering.
+      2. free the later slot — CAS on booked_patient_id=patient_id. Loses if a
+         CONCURRENT pull-forward already moved this patient out of B into a
+         DIFFERENT earlier slot.
+    If EITHER CAS affects 0 rows, the whole move ROLLs BACK and returns False, so
+    the patient can land in at most ONE earlier slot and B is freed at most once.
+    This is what stops the cross-slot double-book when two recoveries race the
+    same booked patient into two different open slots (the to_slot CAS alone does
+    not serialize them — they target different rows; the from_slot CAS does)."""
+    c = connect()  # isolation_level=None -> we control the txn explicitly
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        fill = c.execute(
+            """UPDATE slots SET status = 'filled', booked_patient_id = ?,
+                                type = ?, duration_min = ?, value_eur = ?
+               WHERE id = ? AND status = 'recovering'""",
+            (patient_id, treatment, minutes, value, to_slot_id),
+        )
+        if fill.rowcount != 1:
+            c.execute("ROLLBACK")
+            return False
+        free = c.execute(
+            "UPDATE slots SET status = 'cancelled', booked_patient_id = NULL "
+            "WHERE id = ? AND booked_patient_id = ?",
+            (from_slot_id, patient_id),
+        )
+        if free.rowcount != 1:
+            # the patient was already pulled out of their later slot by a concurrent
+            # move — abort so we don't double-book them into two earlier slots.
+            c.execute("ROLLBACK")
+            return False
+        c.execute("COMMIT")
+        return True
+    except Exception:
+        try:
+            c.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        c.close()
 
 
 def free_slot(sid: int) -> None:

@@ -72,9 +72,17 @@ def post_rank(req: RankRequest) -> RankResponse:
 @app.post("/outcome", response_model=OutcomeResponse)
 def post_outcome(req: OutcomeRequest) -> OutcomeResponse:
     if req.outcome == "booked":
-        repo.set_slot_status(req.slot_id, "filled", booked_patient_id=req.patient_id)
-        repo.finish_recovery(req.slot_id, "filled", req.patient_id)
-        repo.push_attendance(req.patient_id, 1)
+        # Same compare-and-set as the orchestrator: the manual /outcome path must
+        # not double-book either. Only fills if the slot is still 'recovering'.
+        won = repo.try_fill_slot(req.slot_id, req.patient_id)
+        if won:
+            repo.finish_recovery(req.slot_id, "filled", req.patient_id)
+            repo.push_attendance(req.patient_id, 1)
+        else:
+            LOG.warning(
+                "slot %s already filled (race) - manual /outcome skipping double-book",
+                req.slot_id,
+            )
     elif req.outcome == "declined":
         slot = repo.get_slot(req.slot_id)
         if slot:
@@ -123,11 +131,62 @@ def simulate_confirmation_call(slot_id: int):
 # ---- fonio post-call webhook (§6.1) ----
 
 @app.post("/webhook/fonio")
+@app.post("/webhooks/post-call")
 async def fonio_webhook(req: Request):
     payload = await req.json()
-    cid = payload.get("id") or payload.get("call_id") or ""
+
+    # --- robust correlation (the fonio post-call webhook delivers our DEFINED
+    # VARIABLES + from_number; there is NO fonio call id to key on). We round-trip
+    # our own call_attempt_id in `context` and read it back here. Fallback chain:
+    #   1) call_attempt_id (top-level / context / variables)
+    #   2) (slot_id + patient_id) -> resolved to the real call_attempt_id via
+    #      STATE.pending_calls (so the key matches what _wait_for_outcome waits on)
+    #   3) toNumber matched against the single in-flight call (safe: dialing is
+    #      STRICTLY SEQUENTIAL, so at most one call is in flight).
+    ctx = payload.get("context") or {}
+    vars_ = payload.get("variables") or {}
+
+    cid = (
+        payload.get("call_attempt_id")
+        or ctx.get("call_attempt_id")
+        or vars_.get("call_attempt_id")
+    )
     if not cid:
-        raise HTTPException(400, "missing call id")
+        sid = payload.get("slot_id") or ctx.get("slot_id") or vars_.get("slot_id")
+        pid = payload.get("patient_id") or ctx.get("patient_id") or vars_.get("patient_id")
+        if sid is not None and pid is not None:
+            # Resolve to the REAL call_attempt_id (att-<sid>-<pid>-<uuid8>); do NOT
+            # synthesize a bare composite string (it would not match the key the
+            # orchestrator waits on).
+            for k, v in list(STATE.pending_calls.items()):
+                if str(v.get("slot_id")) == str(sid) and str(v.get("patient_id")) == str(pid):
+                    cid = k
+                    break
+    if not cid:
+        # last resort: match the single in-flight call by toNumber
+        to_num = (
+            payload.get("toNumber")
+            or payload.get("to_number")
+            or ctx.get("toNumber")
+            or vars_.get("toNumber")
+        )
+        if to_num:
+            for k, v in list(STATE.pending_calls.items()):
+                if v.get("to_number") == to_num:
+                    cid = k
+                    break
+    if not cid:
+        raise HTTPException(400, "could not correlate webhook to a call")
+
+    # --- idempotency: dedup duplicate (at-least-once) deliveries. Do this BEFORE
+    # mutating STATE so a replayed webhook is a no-op.
+    event_key = f"postcall:{cid}"
+    if not repo.mark_event_processed(event_key, "post_call"):
+        LOG.info("duplicate post-call webhook for %s (deduped)", cid)
+        return {"ok": True, "duplicate": True}
+
+    # --- first delivery: hand off to _wait_for_outcome (keeps the existing
+    # outcome-parsing path intact).
     STATE.webhook_events[cid] = payload
     LOG.info("webhook received for %s", cid)
     return {"ok": True}

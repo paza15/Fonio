@@ -115,8 +115,13 @@ def _vars(patient, slot) -> dict:
 
 def _call(patient, slot, slot_id: int, attempt_id, depth: int, *, pull_forward=False) -> str:
     """Place one offer call and return its outcome (booked/declined/voicemail/
-    callback) or 'refused' if fonio wouldn't take the trigger."""
+    callback), 'refused' if fonio wouldn't take the trigger, or 'busy' if another
+    in-flight recovery already holds this patient (atomic check-and-claim closes
+    the TOCTOU: two concurrent recoveries can never call the same patient)."""
     with _LOCK:
+        if patient.id in _patient_locks:
+            LOG.info("patient %s already in flight in another recovery; skipping", patient.id)
+            return "busy"
         _patient_locks.add(patient.id)
     try:
         if depth == 0:
@@ -145,13 +150,20 @@ def _call(patient, slot, slot_id: int, attempt_id, depth: int, *, pull_forward=F
             _patient_locks.discard(patient.id)
 
 
-def _booked(slot, slot_id, patient, treatment, minutes, value, started_wall, depth) -> None:
-    repo.fill_slot(slot_id, patient.id, treatment, minutes, value)
+def _booked(slot, slot_id, patient, treatment, minutes, value, started_wall, depth) -> bool:
+    """Atomic compare-and-set commit. Returns True only if THIS recovery won the
+    slot (it was still 'recovering'); on False a concurrent winner / duplicate
+    already filled it, so we skip booking + attendance — no double-book."""
+    if not repo.fill_slot(slot_id, patient.id, treatment, minutes, value):
+        LOG.warning("lost race: slot %s already filled, skipping double-book (patient %s)",
+                    slot_id, patient.id)
+        return False
     repo.finish_recovery(slot_id, "filled", patient.id)
     repo.push_attendance(patient.id, 1)
     if depth == 0:
         STATE.time_to_fill_seconds.append(time.time() - started_wall)
     LOG.info("slot %s filled by patient %s (%s, %dmin)", slot_id, patient.id, treatment, minutes)
+    return True
 
 
 def _run(slot_id: int, depth: int = 0) -> None:
@@ -192,12 +204,15 @@ def _run(slot_id: int, depth: int = 0) -> None:
             if patient is None:
                 tried.add(top.patient_id); continue
             outcome = _call(patient, slot, slot_id, attempt_id, depth)
-            if outcome == "refused":
+            if outcome in ("refused", "busy"):
                 tried.add(patient.id); continue
             if outcome == "booked":
                 value = TREATMENT_VALUE.get(top.treatment, slot.value_eur)
-                _booked(slot, slot_id, patient, top.treatment, top.treatment_minutes, value,
-                        started_wall, depth)
+                if not _booked(slot, slot_id, patient, top.treatment, top.treatment_minutes,
+                               value, started_wall, depth):
+                    # lost the slot to a concurrent winner — do NOT book/pack/attend.
+                    tried.add(patient.id)
+                    return
                 booked_someone = True
                 leftover = capacity - top.treatment_minutes
                 if leftover >= MIN_TREATMENT_MIN and depth < MAX_RECOVERY_DEPTH:
@@ -222,13 +237,23 @@ def _run(slot_id: int, depth: int = 0) -> None:
                     break
                 bslot, patient, treatment, minutes, value = cands[0]
                 outcome = _call(patient, slot, slot_id, attempt_id, depth, pull_forward=True)
-                if outcome == "refused":
+                if outcome in ("refused", "busy"):
                     tried.add(patient.id); continue
                 if outcome == "booked":
-                    _booked(slot, slot_id, patient, treatment, minutes, value,
-                            started_wall, depth)
+                    # ATOMIC move: fill THIS slot + free their later slot in one txn.
+                    # If we lost the slot to a concurrent winner, nothing is written —
+                    # the patient is never double-booked.
+                    if not repo.pull_forward_commit(bslot.id, slot_id, patient.id,
+                                                    treatment, minutes, value):
+                        LOG.warning("lost race: pull-forward slot %s already filled, "
+                                    "skipping (patient %s)", slot_id, patient.id)
+                        tried.add(patient.id)
+                        continue
+                    repo.finish_recovery(slot_id, "filled", patient.id)
+                    repo.push_attendance(patient.id, 1)
+                    if depth == 0:
+                        STATE.time_to_fill_seconds.append(time.time() - started_wall)
                     booked_someone = True
-                    repo.free_slot(bslot.id)            # vacate their later slot
                     LOG.info("pull-forward: patient %s moved into slot %s, freeing slot %s",
                              patient.id, slot_id, bslot.id)
                     if depth < MAX_RECOVERY_DEPTH:

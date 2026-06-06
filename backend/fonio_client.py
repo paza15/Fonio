@@ -1,12 +1,16 @@
 """fonio client — real + mock.
 
-Real client posts to the outbound API and stores `fonio_call_id → (slot, patient)`
-at trigger time (the baseline correlation strategy from §6.1). The mock client
-simulates calls deterministically so the orchestrator can be tested without
-fonio credentials.
+The verified fonio outbound API returns NO call id, so we generate our own
+`call_attempt_id` per trigger and round-trip it (plus slot_id, patient_id) inside
+the request `context`. It comes back in the post-call webhook's extracted
+variables, which is how we correlate the async outcome to the in-flight call. We
+also store `call_attempt_id -> (slot, patient, to_number)` in STATE.pending_calls
+at trigger time as a correlation fallback (matched by slot+patient or by toNumber
+against the single in-flight call — dialing is strictly sequential).
 
-The mock fires a webhook event after a short delay; outcomes are driven by
-hand-tuned narrative rules on patient id (see _mock_outcome).
+The mock client simulates calls deterministically (no fonio credentials): it
+fires a webhook event after a short ring delay, keyed by the same call_attempt_id,
+with outcomes scripted per patient id (patient 1 -> BOOKED, others -> DECLINED).
 """
 
 from __future__ import annotations
@@ -41,39 +45,73 @@ class FonioClient:
 # ---- real ----
 
 class RealFonioClient(FonioClient):
+    """VERIFIED fonio outbound contract.
+
+    POST https://app.fonio.ai/api/public/v1/outbound_call
+      header: Authorization: Bearer <FONIO_API_KEY>
+      body  : { fromNumber (E.164, our imported line — it SELECTS the assistant,
+                            there is NO agent_id),
+                toNumber   (^\\+\\d+$),
+                context    (object — round-trips into the post-call webhook's
+                            extracted variables) }
+      resp  : { status: "success"|"error", message } — NO call id is returned.
+
+    Since fonio returns no call id, we generate our OWN call_attempt_id and embed
+    it (+ slot_id, patient_id) in `context` so it round-trips in the post-call
+    webhook for correlation (see main.fonio_webhook).
+    """
+
     def __init__(self):
         self.api_key = os.environ.get("FONIO_API_KEY", "")
-        self.base = os.environ.get("FONIO_BASE_URL", "https://api.fonio.ai")
-        self.offer_agent = os.environ.get("FONIO_OUTBOUND_AGENT_ID", "")
-        self.confirm_agent = os.environ.get("FONIO_CONFIRMATION_AGENT_ID", "")
+        self.from_number = os.environ.get("FONIO_FROM_NUMBER", "")
+        self.url = os.environ.get(
+            "FONIO_OUTBOUND_API_URL",
+            "https://app.fonio.ai/api/public/v1/outbound_call",
+        )
 
-    def _trigger(self, *, agent_id: str, slot_id: int, patient_id: int,
-                 phone: str, variables: dict) -> TriggerResult:
-        # NOTE: exact endpoint/payload TBD — adjust once Kim confirms the
-        # outbound API shape (Saturday-night todo). Until then the contract is:
-        #   POST {base}/v1/outbound { agent_id, to, variables, context }
-        # We always set `context` with our (slot_id, patient_id) — §6.1.
-        payload = {
-            "agent_id": agent_id,
-            "to": phone,
-            "variables": variables,
-            "context": {"slot_id": slot_id, "patient_id": patient_id},
+    def _trigger(self, *, slot_id: int, patient_id: int, phone: str,
+                 variables: dict) -> TriggerResult:
+        call_attempt_id = f"att-{slot_id}-{patient_id}-{uuid.uuid4().hex[:8]}"
+        context = {
+            **variables,
+            "slot_id": slot_id,
+            "patient_id": patient_id,
+            "call_attempt_id": call_attempt_id,
+        }
+        body = {
+            "fromNumber": self.from_number,
+            "toNumber": phone,
+            "context": context,
         }
         try:
             r = httpx.post(
-                f"{self.base}/v1/outbound",
+                self.url,
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json=payload, timeout=15.0,
+                json=body, timeout=15.0,
             )
-            r.raise_for_status()
-            cid = r.json().get("id") or r.json().get("call_id") or ""
+            data = r.json()
+            status = data.get("status")
+            message = data.get("message")
+            accepted = status == "success"
         except Exception as e:
-            return TriggerResult(fonio_call_id="", accepted=False, error=str(e))
-        STATE.pending_calls[cid] = {"slot_id": slot_id, "patient_id": patient_id}
-        return TriggerResult(fonio_call_id=cid, accepted=True)
+            # No call was placed -> do NOT register pending_calls. Return our
+            # generated id so logging/_wait_for_outcome keys still line up.
+            return TriggerResult(fonio_call_id=call_attempt_id, accepted=False, error=str(e))
+        if accepted:
+            STATE.pending_calls[call_attempt_id] = {
+                "slot_id": slot_id, "patient_id": patient_id, "to_number": phone,
+            }
+        return TriggerResult(
+            fonio_call_id=call_attempt_id,
+            accepted=accepted,
+            error=None if accepted else message,
+        )
 
-    def trigger_offer(self, **kw): return self._trigger(agent_id=self.offer_agent, **kw)
-    def trigger_confirmation(self, **kw): return self._trigger(agent_id=self.confirm_agent, **kw)
+    def trigger_offer(self, **kw):
+        return self._trigger(**kw)
+
+    def trigger_confirmation(self, **kw):
+        return self._trigger(**kw)
 
 
 # ---- mock ----
@@ -96,14 +134,18 @@ class MockFonioClient(FonioClient):
 
     def _trigger(self, *, slot_id: int, patient_id: int, phone: str,
                  variables: dict, agent: str) -> TriggerResult:
-        cid = f"mock_{uuid.uuid4().hex[:10]}"
-        STATE.pending_calls[cid] = {"slot_id": slot_id, "patient_id": patient_id}
+        # Mirror the real client's correlation: our own call_attempt_id is the key
+        # the orchestrator waits on, and it is what we carry in `context`.
+        call_attempt_id = f"att-{slot_id}-{patient_id}-{uuid.uuid4().hex[:8]}"
+        STATE.pending_calls[call_attempt_id] = {
+            "slot_id": slot_id, "patient_id": patient_id, "to_number": phone,
+        }
         threading.Thread(
             target=self._fire_webhook,
-            args=(cid, slot_id, patient_id),
+            args=(call_attempt_id, slot_id, patient_id),
             daemon=True,
         ).start()
-        return TriggerResult(fonio_call_id=cid, accepted=True)
+        return TriggerResult(fonio_call_id=call_attempt_id, accepted=True)
 
     def trigger_offer(self, **kw):
         return self._trigger(agent="offer", **kw)
@@ -114,11 +156,17 @@ class MockFonioClient(FonioClient):
     def _fire_webhook(self, cid: str, slot_id: int, patient_id: int):
         time.sleep(self.ring_seconds)
         token, summary = self.OUTCOME_SCRIPT.get(patient_id, self.DEFAULT)
+        # Fire DIRECTLY into STATE.webhook_events keyed by our call_attempt_id,
+        # carrying the same `context` shape the real webhook round-trips, so
+        # _wait_for_outcome resolves identically.
         STATE.webhook_events[cid] = {
-            "id": cid,
             "summary": summary,
             "transcript": f"[mock transcript] {summary}",
-            "context": {"slot_id": slot_id, "patient_id": patient_id},
+            "context": {
+                "slot_id": slot_id,
+                "patient_id": patient_id,
+                "call_attempt_id": cid,
+            },
             "received_at": datetime.now().isoformat(),
         }
 
