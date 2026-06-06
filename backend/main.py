@@ -49,6 +49,7 @@ def post_rank(req: RankRequest) -> RankResponse:
         slot, patients, reliability.predict,
         exclude_ids=set(req.exclude_patient_ids),
         offers_this_week_by_pid=offers,
+        call_stats_by_pid=repo.call_stats_by_pid(),
     )
     candidates = [
         Candidate(

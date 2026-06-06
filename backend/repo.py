@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from backend.db import connect
-from backend.scoring import Patient, Slot, parse_patient, parse_slot
+from backend.scoring import CallStats, Patient, Slot, parse_patient, parse_slot
 
 
 def all_patients() -> list[Patient]:
@@ -64,6 +64,32 @@ def offers_this_week_by_pid() -> dict[int, int]:
             (since,),
         ).fetchall()
     return {r["patient_id"]: r["n"] for r in rows}
+
+
+def call_stats_by_pid() -> dict[int, CallStats]:
+    """Per-patient offer-call history for the learned P(answer)/P(accept) signal.
+
+    answered = picked up (booked/declined/callback); accepted = booked.
+    All history (no date filter) — this is lifetime responsiveness, not the
+    weekly contact cap.
+    """
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT patient_id,
+                      COUNT(*) AS offers,
+                      SUM(CASE WHEN outcome IN ('booked','declined','callback')
+                               THEN 1 ELSE 0 END) AS answered,
+                      SUM(CASE WHEN outcome = 'booked' THEN 1 ELSE 0 END) AS accepted
+               FROM calls
+               WHERE direction = 'outbound' AND outcome IS NOT NULL
+               GROUP BY patient_id""",
+        ).fetchall()
+    return {
+        r["patient_id"]: CallStats(
+            offers=r["offers"], answered=r["answered"] or 0, accepted=r["accepted"] or 0
+        )
+        for r in rows
+    }
 
 
 def create_recovery_attempt(sid: int) -> int:

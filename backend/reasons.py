@@ -10,10 +10,15 @@ from backend.scoring import Ranked
 
 
 def template_reason(r: Ranked) -> str:
-    """`"{days_waiting}d waiting · {window match?} · attendance {x}/5"`"""
+    """`"{days_waiting}d waiting · {window match?} · attendance {x}/5"`,
+    plus the learned call record when the patient has offer history."""
     win = "window match" if r.window_match else "outside preferred window"
     attended, total = r.attendance
-    return f"{r.days_waiting}d waiting · {win} · attendance {attended}/{total}"
+    parts = [f"{r.days_waiting}d waiting", win, f"attendance {attended}/{total}"]
+    offers, answered, _accepted = r.call_history
+    if offers:
+        parts.append(f"answered {answered}/{offers} past calls")
+    return " · ".join(parts)
 
 
 def reason_for(r: Ranked) -> str:

@@ -106,6 +106,7 @@ def _run(slot_id: int) -> None:
                 slot, patients, reliability.predict,
                 exclude_ids=tried | _patient_locks,
                 offers_this_week_by_pid=offers,
+                call_stats_by_pid=repo.call_stats_by_pid(),
             )
             # attach reasons
             cand_for_state = []

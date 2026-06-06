@@ -66,6 +66,7 @@ class Ranked:
     days_waiting: int = 0
     window_match: bool = False
     attendance: tuple[int, int] = (0, 5)
+    call_history: tuple[int, int, int] = (0, 0, 0)  # offers, answered, accepted (from log)
 
 
 # --- decoders ---
@@ -187,6 +188,47 @@ def accept_score(patient: Patient, slot: Slot) -> float:
     return max(0.05, min(0.95, s))
 
 
+# --- learned signal from the call log (§5.2 upgrade) ---
+#
+# The accept score above and the reliability model are *priors*. The system
+# logs every offer call's outcome, so each patient also has an empirical
+# pick-up rate (P answer) and acceptance rate (P accept | answered). We shrink
+# the prior toward those observed rates — the engine learns who actually
+# responds, from its own history, and stays cold-start safe.
+
+@dataclass
+class CallStats:
+    """Per-patient outbound-offer history, from the calls table."""
+    offers: int = 0       # completed offer calls
+    answered: int = 0     # picked up (booked / declined / callback)
+    accepted: int = 0     # booked
+
+# Prior strength = pseudo-observations: how many real calls it takes for the
+# observed rate to outweigh the prior. Higher ⇒ trust the prior longer.
+ANSWER_PRIOR_STRENGTH = 4.0
+ACCEPT_PRIOR_STRENGTH = 4.0
+
+
+def _bayes(prior_mean: float, prior_strength: float, successes: int, trials: int) -> float:
+    """Shrink the prior toward the observed rate as evidence accrues.
+    trials == 0 ⇒ returns the prior unchanged (cold-start safe)."""
+    return (prior_mean * prior_strength + successes) / (prior_strength + trials)
+
+
+def learned_answer(model_p: float, stats: Optional["CallStats"]) -> float:
+    """Blend the model's P(show) prior with the patient's real pick-up rate."""
+    if not stats or stats.offers == 0:
+        return model_p
+    return _bayes(model_p, ANSWER_PRIOR_STRENGTH, stats.answered, stats.offers)
+
+
+def learned_accept(heuristic_p: float, stats: Optional["CallStats"]) -> float:
+    """Blend the §5.2 heuristic prior with the patient's real acceptance rate."""
+    if not stats or stats.answered == 0:
+        return heuristic_p
+    return _bayes(heuristic_p, ACCEPT_PRIOR_STRENGTH, stats.accepted, stats.answered)
+
+
 # --- final priority (§5.4) ---
 
 def deadline_priority(
@@ -213,6 +255,7 @@ def rank(
     max_value_eur: int = 600,
     exclude_ids: set[int] | None = None,
     offers_this_week_by_pid: dict[int, int] | None = None,
+    call_stats_by_pid: dict[int, "CallStats"] | None = None,
     now: Optional[datetime] = None,
     top_k: int = 5,
 ) -> tuple[list[Ranked], list[Skip], str]:
@@ -220,6 +263,7 @@ def rank(
     now = now or datetime.now()
     exclude_ids = exclude_ids or set()
     offers = offers_this_week_by_pid or {}
+    call_stats = call_stats_by_pid or {}
     phase = phase_of(slot, now)
 
     if phase == "UNRECOVERABLE":
@@ -257,14 +301,17 @@ def rank(
     hours_left = (slot.start - now).total_seconds() / 3600.0
     lead_days = max(0.0, hours_left / 24.0)  # a same-day refill ⇒ near-zero booking lead
     for p in accepted:
-        ans = reliability(p, lead_days)
-        acc = accept_score(p, slot)
+        stats = call_stats.get(p.id)
+        # priors (model + heuristic) shrunk toward this patient's real call record
+        ans = learned_answer(reliability(p, lead_days), stats)
+        acc = learned_accept(accept_score(p, slot), stats)
         vnorm = slot.value_eur / max(max_value_eur, 1)
         score, _ = deadline_priority(ans, acc, vnorm, hours_left, p.days_waiting)
         start_t = slot.start.time()
         in_window = p.preferred_window_start <= start_t <= p.preferred_window_end
         attended = sum(p.attendance_history)
         total = max(len(p.attendance_history), 1)
+        ch = (stats.offers, stats.answered, stats.accepted) if stats else (0, 0, 0)
         ranked.append(Ranked(
             patient_id=p.id,
             name=p.name + (" (cooldown override)" if p.id in rescued_ids else ""),
@@ -277,6 +324,7 @@ def rank(
             days_waiting=p.days_waiting,
             window_match=in_window,
             attendance=(attended, total),
+            call_history=ch,
         ))
     ranked.sort(key=lambda r: r.score, reverse=True)
     return ranked[:top_k], skips, phase

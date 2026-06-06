@@ -6,7 +6,8 @@ from __future__ import annotations
 from datetime import datetime, time, timedelta
 
 from backend.scoring import (
-    accept_score, apply_hard_filters, deadline_priority, phase_of, rank,
+    CallStats, _bayes, accept_score, apply_hard_filters, deadline_priority,
+    learned_accept, learned_answer, phase_of, rank,
 )
 from conftest import make_patient, make_slot
 
@@ -131,3 +132,33 @@ def test_rank_excludes_ids_and_caps_top_k():
     ids = {r.patient_id for r in ranked}
     assert 1 not in ids and 2 not in ids
     assert len(ranked) <= 5
+
+
+# --- learned signal from the call log (§5.2 upgrade) ---
+
+def test_bayes_cold_start_returns_prior():
+    assert _bayes(0.8, 4, 0, 0) == 0.8
+
+
+def test_learned_accept_pulls_down_on_declines():
+    # prior 0.8, but the patient answered 4 offers and accepted none
+    assert learned_accept(0.8, CallStats(offers=4, answered=4, accepted=0)) < 0.5
+
+
+def test_learned_accept_cold_start_is_prior():
+    assert learned_accept(0.8, None) == 0.8
+    assert learned_accept(0.8, CallStats()) == 0.8  # no answered calls yet
+
+
+def test_learned_answer_pulls_down_on_voicemails():
+    assert learned_answer(0.85, CallStats(offers=4, answered=0, accepted=0)) < 0.6
+
+
+def test_rank_demotes_chronic_decliner():
+    a = make_patient(id=1)
+    b = make_patient(id=2)  # identical patient, no call history
+    slot = make_slot(type="cleaning", start=NOW + timedelta(hours=48))
+    stats = {1: CallStats(offers=5, answered=5, accepted=0)}  # #1 always declines
+    ranked, _, _ = rank(slot, [a, b], _const_reliability, call_stats_by_pid=stats, now=NOW)
+    assert [r.patient_id for r in ranked] == [2, 1]
+    assert ranked[1].call_history == (5, 5, 0)
