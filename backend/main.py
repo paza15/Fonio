@@ -11,7 +11,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
 
-from backend import orchestrator, reliability, repo
+from backend import orchestrator, prevention, reliability, repo
 from backend.db import init_db
 from backend.reasons import reason_for
 from backend.schemas import (
@@ -118,6 +118,26 @@ def simulate_confirmation_call(slot_id: int):
         raise HTTPException(404, "slot not found")
     repo.cancel_slot(slot_id)
     return orchestrator.trigger_recovery(slot_id)
+
+
+# ---- proactive no-show prevention ----
+
+@app.get("/prevention/at_risk")
+def prevention_at_risk(horizon_hours: int = 48, threshold: float = 0.35):
+    """Upcoming booked appointments predicted at risk of no-show (riskiest first)."""
+    rows = prevention.at_risk_slots(horizon_hours=horizon_hours, threshold=threshold)
+    return {"at_risk": [
+        {"slot_id": sid, "patient_id": p.id, "name": p.name, "risk": round(risk, 3)}
+        for sid, p, risk in rows
+    ]}
+
+
+@app.post("/prevention/sweep")
+def prevention_sweep(horizon_hours: int = 48, threshold: float = 0.35):
+    """Confirmation-call at-risk patients ahead of time; early-cancel + recover any
+    who can't make it. Runs in the background."""
+    prevention.run_sweep_async(horizon_hours=horizon_hours, threshold=threshold)
+    return {"ok": True, "scanning": True}
 
 
 # ---- fonio post-call webhook (§6.1) ----

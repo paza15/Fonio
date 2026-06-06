@@ -70,6 +70,26 @@ def cancel_slot(sid: int) -> None:
     set_slot_status(sid, "cancelled")
 
 
+def upcoming_booked(start, until) -> list[dict]:
+    """Booked appointments with a patient in the [start, until] window — the pool
+    the proactive no-show sweep confirmation-calls."""
+    s = start.isoformat() if hasattr(start, "isoformat") else start
+    u = until.isoformat() if hasattr(until, "isoformat") else until
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT * FROM slots
+               WHERE status = 'booked' AND booked_patient_id IS NOT NULL
+                 AND start_dt > ? AND start_dt <= ? ORDER BY start_dt""",
+            (s, u),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_confirmation(sid: int, status: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE slots SET confirmation_status = ? WHERE id = ?", (status, sid))
+
+
 def fill_slot(sid: int, patient_id: int, treatment: str, minutes: int, value: int) -> None:
     """Book a patient into a freed slot for a specific treatment, adopting that
     treatment's type/duration/value (the freed time becomes their appointment)."""

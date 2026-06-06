@@ -90,9 +90,15 @@ class MockFonioClient(FonioClient):
         4: ("OUTCOME_DECLINED", "Patient cannot make the time on short notice. OUTCOME_DECLINED"),
     }
     DEFAULT = ("OUTCOME_DECLINED", "Patient politely declined the offered slot. OUTCOME_DECLINED")
+    # confirmation sweep: patient_id → outcome; default everyone confirms they're coming
+    CONFIRMATION = {
+        "OUTCOME_CONFIRMED": "Patient confirmed they are coming. OUTCOME_CONFIRMED",
+        "OUTCOME_CANCEL": "Patient says they can no longer make it. OUTCOME_CANCEL",
+    }
 
-    def __init__(self, *, ring_seconds: float = 1.0):
+    def __init__(self, *, ring_seconds: float = 1.0, confirmation_script: dict | None = None):
         self.ring_seconds = ring_seconds
+        self.confirmation_script = confirmation_script or {}
 
     def _trigger(self, *, slot_id: int, patient_id: int, phone: str,
                  variables: dict, agent: str) -> TriggerResult:
@@ -100,7 +106,7 @@ class MockFonioClient(FonioClient):
         STATE.pending_calls[cid] = {"slot_id": slot_id, "patient_id": patient_id}
         threading.Thread(
             target=self._fire_webhook,
-            args=(cid, slot_id, patient_id),
+            args=(cid, slot_id, patient_id, agent),
             daemon=True,
         ).start()
         return TriggerResult(fonio_call_id=cid, accepted=True)
@@ -111,9 +117,13 @@ class MockFonioClient(FonioClient):
     def trigger_confirmation(self, **kw):
         return self._trigger(agent="confirm", **kw)
 
-    def _fire_webhook(self, cid: str, slot_id: int, patient_id: int):
+    def _fire_webhook(self, cid: str, slot_id: int, patient_id: int, agent: str):
         time.sleep(self.ring_seconds)
-        token, summary = self.OUTCOME_SCRIPT.get(patient_id, self.DEFAULT)
+        if agent == "confirm":
+            token = self.confirmation_script.get(patient_id, "OUTCOME_CONFIRMED")
+            summary = self.CONFIRMATION.get(token, token)
+        else:
+            token, summary = self.OUTCOME_SCRIPT.get(patient_id, self.DEFAULT)
         STATE.webhook_events[cid] = {
             "id": cid,
             "summary": summary,
