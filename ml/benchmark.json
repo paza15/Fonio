@@ -1,0 +1,67 @@
+{
+  "cv": "stratified-5-fold",
+  "n": 110521,
+  "base_rate": 0.2019163778829363,
+  "features": [
+    "Age",
+    "lead_days",
+    "SMS_received",
+    "Hipertension",
+    "Diabetes",
+    "Scholarship"
+  ],
+  "results": [
+    {
+      "model": "XGBoost",
+      "auc_mean": 0.7287976516064785,
+      "auc_std": 0.002137594524445669,
+      "folds": [
+        0.7282,
+        0.7285,
+        0.7329,
+        0.727,
+        0.7274
+      ],
+      "seconds": 2.1
+    },
+    {
+      "model": "LightGBM",
+      "auc_mean": 0.7285589028210898,
+      "auc_std": 0.002004404618020276,
+      "folds": [
+        0.7282,
+        0.7279,
+        0.7325,
+        0.7268,
+        0.7275
+      ],
+      "seconds": 1.4
+    },
+    {
+      "model": "AdaBoost",
+      "auc_mean": 0.7250038445461147,
+      "auc_std": 0.002445993892497578,
+      "folds": [
+        0.7251,
+        0.7232,
+        0.7297,
+        0.7237,
+        0.7234
+      ],
+      "seconds": 17.3
+    },
+    {
+      "model": "RandomForest",
+      "auc_mean": 0.722787913544426,
+      "auc_std": 0.0021936098674922165,
+      "folds": [
+        0.7247,
+        0.7203,
+        0.7247,
+        0.7243,
+        0.7199
+      ],
+      "seconds": 10.2
+    }
+  ]
+}

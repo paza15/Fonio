@@ -145,18 +145,22 @@ def make_slots(now: datetime, rng: random.Random) -> list[dict]:
     slots.append(dict(
         id=sid, start_dt=_isoz(today_demo), duration_min=30,
         type="cleaning", value_eur=80, status="booked", booked_patient_id=None,
+        lead_days=6,  # booked ~a week ahead → modest no-show risk
     ))
     sid += 1
-    # Today: one more later cleaning, ESCALATED demo target
+    # Today: a long-lead appointment → high no-show risk (the "flagged red" slot
+    # in the demo) and the ESCALATED target after its cancellation.
     later = now.replace(hour=17, minute=0, second=0, microsecond=0)
     if later <= now:
         later = now + timedelta(hours=3)
     slots.append(dict(
         id=sid, start_dt=_isoz(later), duration_min=30,
         type="crown", value_eur=600, status="booked", booked_patient_id=None,
+        lead_days=64,  # booked ~2 months ahead → high predicted no-show risk
     ))
     sid += 1
-    # Remaining week, 6 slots/day, all booked
+    # Remaining week, 6 slots/day, all booked, with a realistic spread of booking
+    # horizons so the no-show risk badges vary across the schedule.
     for d in range(1, 6):
         day = (now + timedelta(days=d)).replace(hour=8, minute=0, second=0, microsecond=0)
         for h in range(6):
@@ -167,6 +171,7 @@ def make_slots(now: datetime, rng: random.Random) -> list[dict]:
                 duration_min=rng.choice([30, 45, 60]),
                 type=tt, value_eur=val,
                 status="booked", booked_patient_id=None,
+                lead_days=rng.choice([1, 2, 3, 5, 8, 14, 21, 30, 45, 60]),
             ))
             sid += 1
     return slots
@@ -216,9 +221,9 @@ def seed(rng_seed: int = 42, n_random_patients: int = 25) -> None:
         )
         conn.executemany(
             """INSERT INTO slots(id, start_dt, duration_min, type, value_eur,
-                                 status, booked_patient_id)
+                                 status, booked_patient_id, lead_days)
                VALUES (:id, :start_dt, :duration_min, :type, :value_eur,
-                       :status, :booked_patient_id)""",
+                       :status, :booked_patient_id, :lead_days)""",
             slots,
         )
         # Book some random patients into the rest of the week's slots so they

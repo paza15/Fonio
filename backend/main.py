@@ -143,7 +143,8 @@ def dashboard_state() -> DashboardState:
         if r["booked_patient_id"]:
             p = repo.get_patient(r["booked_patient_id"])
             if p:
-                risk = 1.0 - reliability.predict(p)
+                # no-show risk for this booked appt uses its real booking horizon
+                risk = 1.0 - reliability.predict(p, lead_days=float(r.get("lead_days") or 0))
         schedule_out.append(DashboardSlot(
             id=r["id"], start=r["start_dt"], duration_min=r["duration_min"],
             type=r["type"], value_eur=r["value_eur"], status=r["status"],

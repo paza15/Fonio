@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS slots (
     value_eur INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'booked',
     booked_patient_id INTEGER,
+    lead_days INTEGER NOT NULL DEFAULT 0,   -- booking horizon: days the appt was booked ahead (model's top feature)
     FOREIGN KEY(booked_patient_id) REFERENCES patients(id)
 );
 

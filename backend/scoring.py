@@ -21,6 +21,7 @@ class Slot:
     duration_min: int
     type: str
     value_eur: int
+    lead_days: int = 0  # booking horizon (for booked-slot no-show risk); 0 for fresh open slots
 
 
 @dataclass
@@ -109,6 +110,7 @@ def parse_slot(row) -> Slot:
         duration_min=row["duration_min"],
         type=row["type"],
         value_eur=row["value_eur"],
+        lead_days=(row["lead_days"] if "lead_days" in row.keys() else 0),
     )
 
 
@@ -200,7 +202,7 @@ def deadline_priority(
 
 # --- top-level: rank ---
 
-ReliabilityFn = Callable[[Patient], float]
+ReliabilityFn = Callable[..., float]  # (Patient, lead_days: float) -> P(showed)
 
 
 def rank(
@@ -253,8 +255,9 @@ def rank(
 
     ranked: list[Ranked] = []
     hours_left = (slot.start - now).total_seconds() / 3600.0
+    lead_days = max(0.0, hours_left / 24.0)  # a same-day refill ⇒ near-zero booking lead
     for p in accepted:
-        ans = reliability(p)
+        ans = reliability(p, lead_days)
         acc = accept_score(p, slot)
         vnorm = slot.value_eur / max(max_value_eur, 1)
         score, _ = deadline_priority(ans, acc, vnorm, hours_left, p.days_waiting)
