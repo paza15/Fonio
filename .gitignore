@@ -12,7 +12,8 @@ venv/
 *.db-journal
 data/*.sqlite
 data/*.csv
-data/kaggle/
+data/kaggle/*
+!data/kaggle/KaggleV2-May-2016.csv
 ml/*.pkl
 ml/metrics.json
 node_modules/
