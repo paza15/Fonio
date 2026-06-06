@@ -67,6 +67,8 @@ class Ranked:
     window_match: bool = False
     attendance: tuple[int, int] = (0, 5)
     call_history: tuple[int, int, int] = (0, 0, 0)  # offers, answered, accepted (from log)
+    treatment: str = ""          # which treatment they'd get in the freed time
+    treatment_minutes: int = 0   # its duration (capacity it consumes)
 
 
 # --- decoders ---
@@ -138,16 +140,22 @@ def apply_hard_filters(
     *,
     offers_this_week: int = 0,
     only_feasible: bool = False,
+    capacity_min: Optional[int] = None,
 ) -> Optional[str]:
     """Return a skip reason string, or None if patient passes all filters.
 
     `only_feasible=True` relaxes the cooldown rule per §5.3 (allow, flag).
-    Weekly cap is enforced by the caller; we accept the count.
+    `capacity_min` (when set) switches treatment matching to duration-fit:
+    a patient is feasible if any needed treatment fits the open time — this lets
+    a long freed slot be packed with shorter treatments of any type.
     """
     if not patient.consent_outbound:
         return "No consent for outbound calls"
-    if slot.type not in patient.needed_treatments:
-        return "Treatment mismatch"
+    if capacity_min is None:
+        if slot.type not in patient.needed_treatments:
+            return "Treatment mismatch"
+    elif choose_treatment(patient, slot, capacity_min) is None:
+        return "No needed treatment fits the open time"
 
     minutes_left = (slot.start - now).total_seconds() / 60.0
     if not patient.short_notice_ok and minutes_left < 24 * 60:
@@ -167,6 +175,31 @@ def apply_hard_filters(
         return "Weekly contact cap"
 
     return None
+
+
+# --- treatment durations / value (for duration-packing a freed slot) ---
+
+TREATMENT_MINUTES = {"cleaning": 30, "checkup": 30, "filling": 45, "crown": 60}
+TREATMENT_VALUE = {"cleaning": 80, "checkup": 60, "filling": 150, "crown": 600}
+MIN_TREATMENT_MIN = min(TREATMENT_MINUTES.values())
+
+
+def choose_treatment(patient: Patient, slot: Slot, capacity_min: int):
+    """Which treatment this patient would receive in the freed time, or None if
+    none of their needed treatments fit `capacity_min`. Prefers the slot's own
+    type if it fits; else the most valuable needed treatment that fits (money is
+    only a tiebreaker — see deadline_priority). Returns (type, minutes, value)."""
+    fits = [
+        (t, TREATMENT_MINUTES[t], TREATMENT_VALUE[t])
+        for t in patient.needed_treatments
+        if t in TREATMENT_MINUTES and TREATMENT_MINUTES[t] <= capacity_min
+    ]
+    if not fits:
+        return None
+    for t, m, v in fits:
+        if t == slot.type:
+            return (t, m, v)
+    return max(fits, key=lambda x: x[2])
 
 
 # --- accept score (§5.2) ---
@@ -264,6 +297,7 @@ def rank(
     exclude_ids: set[int] | None = None,
     offers_this_week_by_pid: dict[int, int] | None = None,
     call_stats_by_pid: dict[int, "CallStats"] | None = None,
+    capacity_min: int | None = None,
     now: Optional[datetime] = None,
     top_k: int = 5,
 ) -> tuple[list[Ranked], list[Skip], str]:
@@ -284,7 +318,8 @@ def rank(
         if p.id in exclude_ids:
             continue
         reason = apply_hard_filters(
-            p, slot, now, offers_this_week=offers.get(p.id, 0), only_feasible=False
+            p, slot, now, offers_this_week=offers.get(p.id, 0),
+            only_feasible=False, capacity_min=capacity_min,
         )
         if reason:
             skips.append(Skip(p.id, p.name, reason))
@@ -313,7 +348,11 @@ def rank(
         # priors (model + heuristic) shrunk toward this patient's real call record
         ans = learned_answer(reliability(p, lead_days), stats)
         acc = learned_accept(accept_score(p, slot), stats)
-        vnorm = slot.value_eur / max(max_value_eur, 1)
+        if capacity_min is not None:
+            treatment, minutes, tvalue = choose_treatment(p, slot, capacity_min)
+        else:
+            treatment, minutes, tvalue = slot.type, slot.duration_min, slot.value_eur
+        vnorm = tvalue / max(max_value_eur, 1)
         score, _ = deadline_priority(ans, acc, vnorm, hours_left, p.days_waiting)
         start_t = slot.start.time()
         in_window = p.preferred_window_start <= start_t <= p.preferred_window_end
@@ -333,6 +372,8 @@ def rank(
             window_match=in_window,
             attendance=(attended, total),
             call_history=ch,
+            treatment=treatment,
+            treatment_minutes=minutes,
         ))
     ranked.sort(key=lambda r: r.score, reverse=True)
     return ranked[:top_k], skips, phase
