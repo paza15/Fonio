@@ -74,6 +74,26 @@ XGBoost and LightGBM tie within fold noise (±0.003). The ~0.74 ceiling is set b
 the **features, not the algorithm** — we ship LightGBM (faster, native class
 weights, already calibrated).
 
+## Learned scoring priors (`ml/tune_priors.py`)
+Beyond the model, `rank()` shrinks each patient's accept/answer prior toward
+their **observed** call-log rate: `p = (prior·k + successes) / (k + trials)`.
+The strength `k` was tuned, not guessed — by predictive log-loss on 48,225
+leakage-safe Kaggle repeat-patient sequences (predict each appointment's outcome
+from the patient's trailing-5 prior outcomes):
+
+| k | log-loss | Brier |
+|---|---|---|
+| 0 (raw empirical) | 2.876 | 0.243 |
+| 4 | 0.4777 | 0.1517 |
+| **6 (chosen)** | **0.4755** | **0.1507** |
+| 8 | 0.4758 | 0.1508 |
+| ∞ (ignore patient) | 0.4917 | 0.1562 |
+
+Flat optimum at **k=6**: raw rates overfit tiny samples (log-loss 2.88),
+ignoring the patient signal costs +0.016 log-loss. Used for both
+`ANSWER_PRIOR_STRENGTH` and `ACCEPT_PRIOR_STRENGTH` (same repeated-binary
+structure; the accept side awaits real call data to retune directly).
+
 ## Limitations & honesty
 - **Domain transfer:** trained on Brazilian public-health data; it *demonstrates
   the method*. A real deployment retrains on the clinic's own history, which

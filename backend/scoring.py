@@ -203,10 +203,12 @@ class CallStats:
     answered: int = 0     # picked up (booked / declined / callback)
     accepted: int = 0     # booked
 
-# Prior strength = pseudo-observations: how many real calls it takes for the
-# observed rate to outweigh the prior. Higher ⇒ trust the prior longer.
-ANSWER_PRIOR_STRENGTH = 4.0
-ACCEPT_PRIOR_STRENGTH = 4.0
+# Prior strength = pseudo-observations before a patient's observed rate outweighs
+# the prior. Tuned to k≈6 by predictive log-loss on 48,225 Kaggle repeat-patient
+# sequences (ml/tune_priors.py): a flat optimum over 4-8; k=0 (no shrinkage) blows
+# up on small samples (log-loss 2.88), base-only (k→∞) ignores the patient signal.
+ANSWER_PRIOR_STRENGTH = 6.0
+ACCEPT_PRIOR_STRENGTH = 6.0
 
 
 def _bayes(prior_mean: float, prior_strength: float, successes: int, trials: int) -> float:
