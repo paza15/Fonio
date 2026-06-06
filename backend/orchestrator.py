@@ -38,7 +38,26 @@ _patient_locks: set[int] = set()  # §8: lock a patient while a call for them is
 
 WEBHOOK_TIMEOUT_S = int(os.environ.get("WEBHOOK_TIMEOUT_SECONDS", "90"))
 MAX_RECOVERY_DEPTH = int(os.environ.get("MAX_RECOVERY_DEPTH", "3"))
+
+# Reaper lease: a live recovery renews this each candidate. It MUST exceed one
+# call's worst case (WEBHOOK_TIMEOUT_S) so a healthy dial is never reaped; if it
+# expires while the attempt is still 'in_progress', the worker died/restarted and
+# the slot is an orphan the watchdog re-drives.
+REAPER_LEASE_SECONDS = int(os.environ.get("REAPER_LEASE_SECONDS", str(WEBHOOK_TIMEOUT_S + 60)))
+REAPER_INTERVAL_S = int(os.environ.get("REAPER_INTERVAL_SECONDS", "30"))
+# Bound re-drives: a slot whose webhook never arrives (dead/unreachable number, or
+# fonio not firing post-call on no-pickup) would otherwise be re-dialed forever,
+# each a billed call. After MAX_REDRIVES, escalate it to a human instead.
+MAX_REDRIVES = int(os.environ.get("REAPER_MAX_REDRIVES", "3"))
 _client: FonioClient | None = None
+_watchdog_started = False
+
+
+_EPOCH = "1970-01-01T00:00:00"  # an always-expired lease → reaper reclaims next tick
+
+
+def _lease_iso() -> str:
+    return (datetime.now() + timedelta(seconds=REAPER_LEASE_SECONDS)).isoformat()
 
 
 def _client_lazy() -> FonioClient:
@@ -65,7 +84,7 @@ def _parse_hhmm(s: str) -> dtime:
 # --- public entrypoint ---
 
 def trigger_recovery(slot_id: int, depth: int = 0) -> dict:
-    """Idempotent. Returns status JSON. depth>0 = a cascade/leftover recovery."""
+    """Idempotent + state-guarded. Returns status JSON. depth>0 = cascade/leftover."""
     with _LOCK:
         if slot_id in _in_flight:
             return {"ok": False, "reason": "already recovering"}
@@ -75,11 +94,55 @@ def trigger_recovery(slot_id: int, depth: int = 0) -> dict:
             return {"ok": False, "reason": "duplicate cancellation event (idempotent)"}
         _in_flight.add(slot_id)
 
-    repo.set_slot_status(slot_id, "recovering")
-    if depth == 0:
-        STATE.recovery = CurrentRecovery(slot_id=slot_id, phase="—", started_at=datetime.now())
-    threading.Thread(target=_run, args=(slot_id, depth), daemon=True).start()
-    return {"ok": True}
+    # Everything past the reserved attempt is wrapped: if setup raises AFTER we
+    # added slot_id to _in_flight (a transient 'database is locked' in
+    # begin_recovery/set_recovery_lease, or the OS refusing a new thread), the slot
+    # must NOT be stranded — pinned in _in_flight, attempt 'in_progress', worker
+    # never running, and (if the CAS hadn't run) invisible to BOTH the reaper and a
+    # re-trigger. Unwind so the slot is recoverable again.
+    try:
+        # State-machine guard: only a freed slot (cancelled/open) may ENTER recovery.
+        # Atomic CAS, so we can never clobber a 'filled'/'booked'/already-'recovering'
+        # slot. If it isn't recoverable, release the attempt we just opened and bail.
+        if not repo.begin_recovery(slot_id):
+            repo.finish_recovery(slot_id, "aborted_not_recoverable", None)
+            with _LOCK:
+                _in_flight.discard(slot_id)
+            return {"ok": False, "reason": "slot not in a recoverable state"}
+
+        repo.set_recovery_lease(slot_id, _lease_iso())
+        if depth == 0:
+            STATE.recovery = CurrentRecovery(slot_id=slot_id, phase="—", started_at=datetime.now())
+        threading.Thread(target=_run, args=(slot_id, depth), daemon=True).start()
+        return {"ok": True}
+    except Exception:
+        LOG.exception("trigger_recovery setup failed for slot %s; unwinding", slot_id)
+        try:
+            # If we already flipped the slot to 'recovering', escalate it (surface to
+            # a human) and finalize the attempt. Otherwise the slot is still a freed
+            # 'cancelled'/'open' slot and the CAS never ran — DROP the reserved attempt
+            # (delete_recovery_attempt) so a fresh trigger/cancel can recover it
+            # cleanly instead of being permanently rejected by the UNIQUE row.
+            if repo.escalate_if_recovering(slot_id):
+                repo.finish_recovery(slot_id, "error", None)
+            else:
+                repo.delete_recovery_attempt(slot_id)
+        except Exception:
+            # Double-fault: the unwind ITSELF hit the DB lock, so the slot may be left
+            # 'recovering'/'in_progress'. This is NOT a permanent strand — _in_flight is
+            # still cleared below (no in-memory pin) and the reaper self-heals it — but
+            # best-effort null the lease so the reaper reclaims it on the NEXT tick
+            # rather than after a full lease window.
+            LOG.exception("failed to unwind stranded recovery for slot %s; "
+                          "leaving it for the reaper", slot_id)
+            try:
+                repo.set_recovery_lease(slot_id, _EPOCH)
+            except Exception:
+                pass
+        finally:
+            with _LOCK:
+                _in_flight.discard(slot_id)
+        return {"ok": False, "reason": "recovery setup failed"}
 
 
 # --- helpers ---
@@ -140,8 +203,8 @@ def _call(patient, slot, slot_id: int, attempt_id, depth: int, *, pull_forward=F
         repo.record_offer_called(patient.id)
         repo.log_call(
             fonio_call_id=tr.fonio_call_id, recovery_attempt_id=attempt_id,
-            patient_id=patient.id, slot_id=slot_id, direction="outbound",
-            outcome=None, summary=None)
+            patient_id=patient.id, slot_id=slot_id, to_number=patient.phone,
+            direction="outbound", outcome=None, summary=None)
         outcome, summary = _wait_for_outcome(tr.fonio_call_id, timeout=WEBHOOK_TIMEOUT_S)
         repo.update_call_outcome(tr.fonio_call_id, outcome, summary or "")
         return outcome
@@ -175,7 +238,7 @@ def _run(slot_id: int, depth: int = 0) -> None:
             return
         if not in_call_window():
             LOG.info("outside call window; escalating slot %s", slot_id)
-            repo.set_slot_status(slot_id, "escalated")
+            repo.escalate_if_recovering(slot_id)
             repo.finish_recovery(slot_id, "escalated_window", None)
             return
 
@@ -203,9 +266,19 @@ def _run(slot_id: int, depth: int = 0) -> None:
             patient = repo.get_patient(top.patient_id)
             if patient is None:
                 tried.add(top.patient_id); continue
+            repo.set_recovery_lease(slot_id, _lease_iso())   # renew before a (slow) call
             outcome = _call(patient, slot, slot_id, attempt_id, depth)
             if outcome in ("refused", "busy"):
                 tried.add(patient.id); continue
+            if outcome == "timeout":
+                # Outcome UNKNOWN (no webhook within budget). Do NOT give the slot
+                # away — a late 'yes' must still be able to win. Leave it
+                # 'recovering' + 'in_progress'; the reaper re-drives once the lease
+                # expires. (A definitive voicemail/no-answer DOES advance — only a
+                # genuine timeout is treated as "unknown", never as a decline.)
+                LOG.warning("slot %s: UNKNOWN outcome (webhook timeout) for patient %s; "
+                            "holding the slot for the reaper, not advancing", slot_id, patient.id)
+                return
             if outcome == "booked":
                 value = TREATMENT_VALUE.get(top.treatment, slot.value_eur)
                 if not _booked(slot, slot_id, patient, top.treatment, top.treatment_minutes,
@@ -236,9 +309,14 @@ def _run(slot_id: int, depth: int = 0) -> None:
                 if not cands:
                     break
                 bslot, patient, treatment, minutes, value = cands[0]
+                repo.set_recovery_lease(slot_id, _lease_iso())   # renew before a (slow) call
                 outcome = _call(patient, slot, slot_id, attempt_id, depth, pull_forward=True)
                 if outcome in ("refused", "busy"):
                     tried.add(patient.id); continue
+                if outcome == "timeout":
+                    LOG.warning("slot %s: UNKNOWN outcome (timeout, pull-forward) for "
+                                "patient %s; holding for the reaper", slot_id, patient.id)
+                    return
                 if outcome == "booked":
                     # ATOMIC move: fill THIS slot + free their later slot in one txn.
                     # If we lost the slot to a concurrent winner, nothing is written —
@@ -265,8 +343,20 @@ def _run(slot_id: int, depth: int = 0) -> None:
         if not booked_someone:
             LOG.info("slot %s exhausted/unrecoverable", slot_id)
             status = "unrecoverable" if (slot.start - datetime.now()) < timedelta(minutes=20) else "escalated"
-            repo.set_slot_status(slot_id, status)
+            repo.transition_slot(slot_id, {"recovering"}, status)
             repo.finish_recovery(slot_id, f"{status}_exhausted", None)
+    except Exception:
+        # Any crash mid-recovery (e.g. a transient 'database is locked') must NOT
+        # leave the slot bricked in 'recovering'. Escalate it — but ONLY if it is
+        # still 'recovering', so we never clobber a slot a concurrent winner already
+        # filled — and finish the attempt, so the slot is surfaced to a human,
+        # re-triggerable, and reapable instead of stuck forever.
+        LOG.exception("recovery for slot %s crashed; escalating to a human", slot_id)
+        try:
+            if repo.escalate_if_recovering(slot_id):
+                repo.finish_recovery(slot_id, "error", None)
+        except Exception:
+            LOG.exception("failed to escalate slot %s after crash", slot_id)
     finally:
         with _LOCK:
             _in_flight.discard(slot_id)
@@ -276,13 +366,73 @@ def _run(slot_id: int, depth: int = 0) -> None:
 
 
 def _wait_for_outcome(fonio_call_id: str, *, timeout: int) -> tuple[str, str]:
-    """Polls STATE.webhook_events. Returns (outcome, summary)."""
+    """Polls STATE.webhook_events. Returns (outcome, summary).
+
+    On timeout returns ('timeout', …) — NOT 'voicemail'. A timeout means the
+    post-call webhook simply hasn't arrived yet: the outcome is genuinely UNKNOWN.
+    Classifying it as voicemail would treat a possible 'yes' as a no-answer and
+    hand the slot to someone else; instead the caller HOLDS the slot for the reaper.
+    A real voicemail/no-answer arrives AS a webhook and is parsed as 'voicemail'."""
     from backend.outcome_parser import parse_outcome
     deadline = time.time() + timeout
     while time.time() < deadline:
         ev = STATE.webhook_events.pop(fonio_call_id, None)
         if ev is not None:
+            STATE.pending_calls.pop(fonio_call_id, None)   # consumed → prune (no leak)
             outcome = parse_outcome(ev.get("summary"), disconnect_reason=ev.get("disconnectReason"))
             return outcome, ev.get("summary", "") or ""
         time.sleep(0.25)
-    return "voicemail", "[orchestrator] webhook timeout"
+    return "timeout", "[orchestrator] webhook timeout"
+
+
+# --- reaper / watchdog: self-heal orphaned recoveries -----------------------
+
+def reap_orphans() -> int:
+    """Re-drive recoveries whose worker died or whose process restarted (lease
+    expired while the attempt is still 'in_progress' and the slot still
+    'recovering'). The DB claim is an atomic CAS, so overlapping ticks / workers
+    yield AT MOST ONE re-drive per orphan. Returns how many were re-driven. Safe to
+    call on startup (crash recovery) and on a timer (wedged-worker recovery)."""
+    now_iso = datetime.now().isoformat()
+    count = 0
+    for sid in repo.orphaned_recovery_slot_ids(now_iso):
+        with _LOCK:
+            if sid in _in_flight:        # a live worker in THIS process owns it
+                continue
+        if not repo.claim_orphan(sid, now_iso, _lease_iso()):
+            continue                     # another claimer won the race
+        if repo.recovery_redrive_count(sid) > MAX_REDRIVES:
+            # exhausted re-drives (e.g. a number that never answers) — stop dialing
+            # and surface it to a human instead of looping billed calls forever.
+            LOG.warning("reaper: slot %s exceeded %d re-drives; escalating to a human",
+                        sid, MAX_REDRIVES)
+            repo.transition_slot(sid, {"recovering"}, "escalated")
+            repo.finish_recovery(sid, "escalated_max_redrives", None)
+            continue
+        with _LOCK:
+            _in_flight.add(sid)
+        LOG.warning("reaper: re-driving orphaned recovery for slot %s", sid)
+        with STATE.lock:
+            STATE.recovery = CurrentRecovery(slot_id=sid, phase="reaped", started_at=datetime.now())
+        threading.Thread(target=_run, args=(sid, 0), daemon=True).start()
+        count += 1
+    return count
+
+
+def start_watchdog() -> None:
+    """Start the background reaper loop exactly once per process."""
+    global _watchdog_started
+    with _LOCK:
+        if _watchdog_started:
+            return
+        _watchdog_started = True
+
+    def _loop():
+        while True:
+            time.sleep(REAPER_INTERVAL_S)
+            try:
+                reap_orphans()
+            except Exception:
+                LOG.exception("watchdog reap tick failed")
+
+    threading.Thread(target=_loop, daemon=True).start()

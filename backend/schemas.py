@@ -100,6 +100,7 @@ class Metrics(BaseModel):
     eur_recovered: int
     avg_time_to_fill_seconds: Optional[float]
     outcomes: dict[str, int]
+    dead_letters: int = 0  # uncorrelatable post-call webhooks parked for review (observability)
 
 
 class DashboardState(BaseModel):

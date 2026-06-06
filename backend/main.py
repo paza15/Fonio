@@ -5,7 +5,9 @@ Run: `uvicorn backend.main:app --reload`
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from datetime import datetime
 from typing import Optional
 
@@ -30,6 +32,12 @@ app = FastAPI(title="fonio Slot Refill Engine")
 def _startup():
     init_db()
     reliability.load()
+    # Crash recovery: re-drive recoveries orphaned by a previous crash/restart,
+    # then keep a background watchdog re-driving wedged/expired ones. (The watchdog
+    # can be disabled in tests with ORCHESTRATOR_WATCHDOG=false.)
+    orchestrator.reap_orphans()
+    if os.environ.get("ORCHESTRATOR_WATCHDOG", "true").lower() == "true":
+        orchestrator.start_watchdog()
 
 
 # ---- Track A↔B contract (§4) ----
@@ -103,7 +111,8 @@ def post_outcome(req: OutcomeRequest) -> OutcomeResponse:
 def simulate_cancel(slot_id: int):
     if not repo.get_slot(slot_id):
         raise HTTPException(404, "slot not found")
-    repo.cancel_slot(slot_id)
+    if not repo.cancel_slot(slot_id):
+        raise HTTPException(409, "slot cannot be cancelled in its current state")
     return orchestrator.trigger_recovery(slot_id)
 
 
@@ -114,7 +123,8 @@ def simulate_no_show(slot_id: int):
     already detects UNRECOVERABLE via phase."""
     if not repo.get_slot(slot_id):
         raise HTTPException(404, "slot not found")
-    repo.cancel_slot(slot_id)
+    if not repo.cancel_slot(slot_id):
+        raise HTTPException(409, "slot cannot be cancelled in its current state")
     return orchestrator.trigger_recovery(slot_id)
 
 
@@ -124,7 +134,8 @@ def simulate_confirmation_call(slot_id: int):
     cancellation trigger so the recovery loop kicks off visibly."""
     if not repo.get_slot(slot_id):
         raise HTTPException(404, "slot not found")
-    repo.cancel_slot(slot_id)
+    if not repo.cancel_slot(slot_id):
+        raise HTTPException(409, "slot cannot be cancelled in its current state")
     return orchestrator.trigger_recovery(slot_id)
 
 
@@ -171,32 +182,45 @@ async def fonio_webhook(req: Request):
         or ctx.get("call_attempt_id")
         or vars_.get("call_attempt_id")
     )
+    # Pull the correlation keys once (used by both in-memory and persisted fallbacks).
+    sid = payload.get("slot_id") or ctx.get("slot_id") or vars_.get("slot_id")
+    pid = payload.get("patient_id") or ctx.get("patient_id") or vars_.get("patient_id")
+    to_num = (
+        payload.get("toNumber") or payload.get("to_number")
+        or ctx.get("toNumber") or vars_.get("toNumber")
+    )
+
+    if not cid and sid is not None and pid is not None:
+        # Resolve to the REAL call_attempt_id (att-<sid>-<pid>-<uuid8>) from the
+        # in-memory in-flight map; do NOT synthesize a bare composite string (it
+        # would not match the key the orchestrator waits on).
+        for k, v in list(STATE.pending_calls.items()):
+            if str(v.get("slot_id")) == str(sid) and str(v.get("patient_id")) == str(pid):
+                cid = k
+                break
+
+    if not cid and to_num:
+        # match the single in-flight call by toNumber (dialing is sequential)
+        for k, v in list(STATE.pending_calls.items()):
+            if v.get("to_number") == to_num:
+                cid = k
+                break
+
     if not cid:
-        sid = payload.get("slot_id") or ctx.get("slot_id") or vars_.get("slot_id")
-        pid = payload.get("patient_id") or ctx.get("patient_id") or vars_.get("patient_id")
-        if sid is not None and pid is not None:
-            # Resolve to the REAL call_attempt_id (att-<sid>-<pid>-<uuid8>); do NOT
-            # synthesize a bare composite string (it would not match the key the
-            # orchestrator waits on).
-            for k, v in list(STATE.pending_calls.items()):
-                if str(v.get("slot_id")) == str(sid) and str(v.get("patient_id")) == str(pid):
-                    cid = k
-                    break
+        # PERSISTED fallback: STATE.pending_calls is in-memory and is wiped by a
+        # restart, but the call row is on disk. Correlate from the calls table by
+        # slot+patient, else by to_number — so a webhook that lands AFTER a restart
+        # still finds its call instead of being lost.
+        cid = (repo.find_inflight_call_id(slot_id=sid, patient_id=pid)
+               or repo.find_inflight_call_id(to_number=to_num))
+
     if not cid:
-        # last resort: match the single in-flight call by toNumber
-        to_num = (
-            payload.get("toNumber")
-            or payload.get("to_number")
-            or ctx.get("toNumber")
-            or vars_.get("toNumber")
-        )
-        if to_num:
-            for k, v in list(STATE.pending_calls.items()):
-                if v.get("to_number") == to_num:
-                    cid = k
-                    break
-    if not cid:
-        raise HTTPException(400, "could not correlate webhook to a call")
+        # Cannot correlate. Do NOT 400 — a 4xx tells fonio's at-least-once retry to
+        # give up and the outcome is lost forever. ACK with 200 and DEAD-LETTER the
+        # payload for inspection / manual replay instead of dropping it.
+        repo.record_dead_letter(json.dumps(payload), "uncorrelated post-call webhook")
+        LOG.warning("post-call webhook could not be correlated; dead-lettered")
+        return {"ok": False, "deadletter": True}
 
     # --- idempotency: dedup duplicate (at-least-once) deliveries. Do this BEFORE
     # mutating STATE so a replayed webhook is a no-op.
@@ -258,6 +282,7 @@ def dashboard_state() -> DashboardState:
         eur_recovered=int(stats["eur"]),
         avg_time_to_fill_seconds=avg,
         outcomes=repo.outcomes_breakdown(),
+        dead_letters=repo.count_dead_letters(),
     )
     return DashboardState(
         now=datetime.now().isoformat(),
