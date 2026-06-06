@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS slots (
     status TEXT NOT NULL DEFAULT 'booked',
     booked_patient_id INTEGER,
     lead_days INTEGER NOT NULL DEFAULT 0,   -- booking horizon: days the appt was booked ahead (model's top feature)
+    confirmation_status TEXT,               -- proactive sweep: confirmed | at_risk | cancelled
     FOREIGN KEY(booked_patient_id) REFERENCES patients(id)
 );
 
@@ -125,6 +127,15 @@ def cursor():
 
 
 def reset_db() -> None:
-    if DB_PATH.exists():
-        DB_PATH.unlink()
+    # On Windows a background recovery thread may briefly hold the file open;
+    # retry the unlink so a fresh seed/test reset doesn't race it.
+    for path in (DB_PATH, DB_PATH.with_suffix(".sqlite-wal"), DB_PATH.with_suffix(".sqlite-shm")):
+        for _ in range(50):
+            if not path.exists():
+                break
+            try:
+                path.unlink()
+                break
+            except PermissionError:
+                time.sleep(0.1)
     init_db()

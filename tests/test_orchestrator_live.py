@@ -68,6 +68,9 @@ def _wait(pred, timeout=20.0):
 
 @pytest.fixture(autouse=True)
 def _fresh():
+    deadline = time.time() + 5          # let any prior recovery threads finish (Win file lock)
+    while orchestrator._in_flight and time.time() < deadline:
+        time.sleep(0.05)
     reset_db()
     reliability.load()
     orchestrator._in_flight.clear()

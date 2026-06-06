@@ -20,8 +20,8 @@ what's measured, and what's left (fonio + dashboard).
   (08:00–19:00), **90 s webhook timeout → voicemail**, **<20 min → unrecoverable**,
   **waitlist exhausted → escalate to a human**.
 - **Persistence:** patients, slots, recovery_attempts, calls — survives restart.
-- **Tests:** **31 tests** (incl. live-orchestrator packing + pull-forward/cascade
-  integration tests) + an end-to-end smoke test, all green.
+- **Tests:** **34 tests** (incl. live-orchestrator packing + pull-forward/cascade
+  integration tests and the prevention sweep) + an end-to-end smoke test, all green.
 
 ### ML — no-show / reliability model
 - Trained on the real Kaggle "Medical Appointment No Shows" data (110,521 rows),
@@ -57,11 +57,20 @@ what's measured, and what's left (fonio + dashboard).
   - Proven end-to-end by live integration tests; planner also returns scores
     (utilization, € recovered, patients helped, cascades).
 
+### Proactive no-show prevention (the model, used *before* the chair empties)
+- A confirmation **sweep** ([prevention.py](backend/prevention.py)) scores upcoming
+  booked appointments and confirmation-calls the risky ones ahead of time:
+  - "coming" → **confirmed**; "can't make it" → **cancel early + recover now**
+    (max lead time → best refill); no answer → **at-risk, flag a human** (§8).
+- Endpoints: `GET /prevention/at_risk`, `POST /prevention/sweep`.
+- Reframes the pitch from reactive ("fill the gap") to predictive ("stop the gap").
+
 ### Demonstrations (`python -m scripts.<name>`)
 - `smoke_test` — end-to-end cancel → rank → call → book.
 - `demo_learning` — a chronic decliner / never-answers patient drop out of the top-5.
-- `demo_scheduling` — packing (100% util, 2 patients), pull-forward+cascade
-  (2 patients, 1 cascade), fairness (long-waiter beats high-value).
+- `demo_scheduling` — packing (100% util, 2 patients), pull-forward+cascade, fairness.
+- `demo_prevention` — sweep flags at-risk appointments; the riskiest cancels early
+  and is sent to recovery before it becomes an empty chair.
 
 ---
 
