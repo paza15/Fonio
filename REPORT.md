@@ -20,7 +20,8 @@ what's measured, and what's left (fonio + dashboard).
   (08:00–19:00), **90 s webhook timeout → voicemail**, **<20 min → unrecoverable**,
   **waitlist exhausted → escalate to a human**.
 - **Persistence:** patients, slots, recovery_attempts, calls — survives restart.
-- **Tests:** **29 unit tests** + an end-to-end smoke test, all green.
+- **Tests:** **31 tests** (incl. live-orchestrator packing + pull-forward/cascade
+  integration tests) + an end-to-end smoke test, all green.
 
 ### ML — no-show / reliability model
 - Trained on the real Kaggle "Medical Appointment No Shows" data (110,521 rows),
@@ -44,13 +45,17 @@ what's measured, and what's left (fonio + dashboard).
   48k sequences ([tune_priors.py](ml/tune_priors.py)) — not guessed.
 - **Ethics — money is the least factor:** treatment value swings the score by at
   most **±10%**; a 40-day-waiter on a cheap cleaning beats a fresh €600 crown.
-- **Capacity-aware recovery planner** ([scheduling.py](backend/scheduling.py)),
-  pure + tested + demoed:
-  - **Duration packing** — fill one long freed slot with several short treatments.
+- **Capacity-aware recovery — now LIVE in the orchestrator** (pure planner in
+  [scheduling.py](backend/scheduling.py) + wired into [orchestrator.py](backend/orchestrator.py)):
+  - **Duration packing** — fill one long freed slot with several short treatments
+    (leftover time spins off as its own recovery).
   - **Pull-forward** — if the waitlist can't fill it, pull a patient booked *later*
     into the earlier slot (nearby: any fitting treatment; weeks-ahead: same type only).
-  - **Cascade** — the slot they vacate is recovered again (bounded depth).
-  - Returns scores: utilization, € recovered, patients helped, cascades.
+  - **Cascade** — the slot they vacate is recovered again (bounded by MAX_RECOVERY_DEPTH).
+  - **No double-booking:** Tier 1 ranks only true waitlist patients (no current
+    appointment); pull-forward targets booked patients.
+  - Proven end-to-end by live integration tests; planner also returns scores
+    (utilization, € recovered, patients helped, cascades).
 
 ### Demonstrations (`python -m scripts.<name>`)
 - `smoke_test` — end-to-end cancel → rank → call → book.
@@ -85,10 +90,8 @@ what's measured, and what's left (fonio + dashboard).
 - **Weight:** 15% of judging; it's the biggest *unbuilt* scoring item.
 
 ### Other open items
-- **Wire the planner into the live orchestrator** — the packing/pull-forward planner
-  is built, tested, and demoed as a pure module, but the live loop still does
-  single-slot fill. Integration is the next backend step (kept separate to protect
-  the working demo before freeze).
+- ~~Wire the planner into the live orchestrator~~ — **done** (packing + pull-forward
+  + cascade run in the live recovery loop; covered by live integration tests).
 - **README** (setup/run + real-vs-mocked table), 3-min video, Tally form (§11).
 
 ---

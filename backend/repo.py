@@ -11,7 +11,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from backend.db import connect
-from backend.scoring import CallStats, Patient, Slot, parse_patient, parse_slot
+from backend.scoring import (
+    TREATMENT_MINUTES, TREATMENT_VALUE, CallStats, Patient, Slot,
+    parse_patient, parse_slot,
+)
 
 
 def all_patients() -> list[Patient]:
@@ -24,6 +27,20 @@ def get_patient(pid: int) -> Optional[Patient]:
     with _conn() as c:
         row = c.execute("SELECT * FROM patients WHERE id = ?", (pid,)).fetchone()
     return parse_patient(row) if row else None
+
+
+def waitlist_patients() -> list[Patient]:
+    """Patients with NO active appointment — the true waitlist. Excludes anyone
+    currently booked (they're handled by pull-forward, not cold-offered a slot)."""
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT * FROM patients WHERE id NOT IN (
+                 SELECT booked_patient_id FROM slots
+                 WHERE booked_patient_id IS NOT NULL
+                   AND status IN ('booked', 'filled', 'recovering')
+               )"""
+        ).fetchall()
+    return [parse_patient(r) for r in rows]
 
 
 def get_slot(sid: int) -> Optional[Slot]:
@@ -51,6 +68,81 @@ def set_slot_status(sid: int, status: str, booked_patient_id: Optional[int] = No
 
 def cancel_slot(sid: int) -> None:
     set_slot_status(sid, "cancelled")
+
+
+def fill_slot(sid: int, patient_id: int, treatment: str, minutes: int, value: int) -> None:
+    """Book a patient into a freed slot for a specific treatment, adopting that
+    treatment's type/duration/value (the freed time becomes their appointment)."""
+    with _conn() as c:
+        c.execute(
+            """UPDATE slots SET status = 'filled', booked_patient_id = ?,
+                                type = ?, duration_min = ?, value_eur = ?
+               WHERE id = ?""",
+            (patient_id, treatment, minutes, value, sid),
+        )
+
+
+def free_slot(sid: int) -> None:
+    """Vacate a slot (a patient was pulled forward out of it) so it can recover."""
+    with _conn() as c:
+        c.execute(
+            "UPDATE slots SET status = 'cancelled', booked_patient_id = NULL WHERE id = ?",
+            (sid,),
+        )
+
+
+def create_open_slot(start_dt, duration_min: int, slot_type: str, value_eur: int) -> int:
+    """Create a new open (cancelled→to-recover) slot — used for leftover capacity
+    after packing. Returns its id."""
+    start = start_dt.isoformat() if hasattr(start_dt, "isoformat") else start_dt
+    with _conn() as c:
+        cur = c.execute(
+            """INSERT INTO slots(start_dt, duration_min, type, value_eur, status,
+                                 booked_patient_id)
+               VALUES (?, ?, ?, ?, 'cancelled', NULL)""",
+            (start, duration_min, slot_type, value_eur),
+        )
+        return cur.lastrowid
+
+
+def pull_forward_candidates(slot: Slot, capacity_min: int, *, now=None,
+                            exclude_pids: Optional[set[int]] = None) -> list[tuple]:
+    """Patients booked LATER than `slot` who could be pulled forward into it.
+
+    Nearby slots (≤14d) may swap any treatment that fits; weeks-ahead slots only
+    the SAME treatment. Respects consent + short-notice. Returns
+    [(booked_slot, patient, treatment, minutes, value), ...] sorted by how much
+    earlier they'd be seen (fairness) — money is never used here.
+    """
+    now = now or datetime.now()
+    exclude = exclude_pids or set()
+    near_cutoff = slot.start + timedelta(days=14)
+    short_notice_slot = (slot.start - now).total_seconds() < 24 * 3600
+    with _conn() as c:
+        rows = c.execute(
+            """SELECT * FROM slots
+               WHERE status = 'booked' AND booked_patient_id IS NOT NULL
+                 AND start_dt > ? ORDER BY start_dt""",
+            (slot.start.isoformat(),),
+        ).fetchall()
+    out = []
+    for r in rows:
+        bslot = parse_slot(r)
+        patient = get_patient(r["booked_patient_id"])
+        if not patient or patient.id in exclude or not patient.consent_outbound:
+            continue
+        if short_notice_slot and not patient.short_notice_ok:
+            continue
+        minutes = TREATMENT_MINUTES.get(bslot.type, bslot.duration_min)
+        value = TREATMENT_VALUE.get(bslot.type, bslot.value_eur)
+        if minutes > capacity_min:
+            continue
+        if bslot.start > near_cutoff and bslot.type != slot.type:
+            continue
+        days_earlier = (bslot.start - slot.start).days
+        out.append((days_earlier, bslot, patient, bslot.type, minutes, value))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return [(b, p, t, m, v) for (_d, b, p, t, m, v) in out]
 
 
 def offers_this_week_by_pid() -> dict[int, int]:

@@ -91,7 +91,7 @@ class MockFonioClient(FonioClient):
     }
     DEFAULT = ("OUTCOME_DECLINED", "Patient politely declined the offered slot. OUTCOME_DECLINED")
 
-    def __init__(self, *, ring_seconds: float = 2.5):
+    def __init__(self, *, ring_seconds: float = 1.0):
         self.ring_seconds = ring_seconds
 
     def _trigger(self, *, slot_id: int, patient_id: int, phone: str,

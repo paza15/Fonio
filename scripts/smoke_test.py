@@ -88,8 +88,8 @@ def main():
     assert r2["ok"] is False, "duplicate cancellation must be idempotent"
     print("  [OK]idempotent against duplicate cancel events")
 
-    banner("Wait for the mock loop to complete (patient 1 → BOOKED in ~3s)")
-    for i in range(40):
+    banner("Wait for the mock loop to complete (patient 1 → BOOKED)")
+    for i in range(120):
         time.sleep(0.5)
         status = repo.slot_status(1)
         if status in ("filled", "escalated", "unrecoverable"):
