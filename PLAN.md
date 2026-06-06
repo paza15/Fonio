@@ -131,8 +131,11 @@ urgency_mode = clamp((24 − hours_left)/24, 0, 1)     # 0 relaxed → 1 panic
 answer = reliability_model(patient)                   # §5.1
 accept = accept_score(patient, slot)                  # §5.2
 value  = treatment_value(patient, slot) / max_value   # normalized
-score  = answer**(1+urgency_mode) * accept * value**(1−0.7*urgency_mode)
+score  = answer**(1+urgency_mode) * accept * (0.9 + 0.1*value)   # ETHICS: money = ±10% tiebreaker only
 ```
+**Ethics — money is the least factor:** treatment value can swing the score by at
+most ±10%; we never prioritise patients by revenue. Who'll actually take the slot
+(answer×accept) and fairness (waiting time) dominate.
 Starvation guard: waiting > 30 days ⇒ score ×1.5.
 Phase label for dashboard: RELAXED (>24h) / URGENT (2–24h) / CRITICAL (<2h) / UNRECOVERABLE (<20 min or list empty).
 Name in pitch: **"deadline-aware dispatch."**

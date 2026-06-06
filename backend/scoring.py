@@ -236,9 +236,15 @@ def learned_accept(heuristic_p: float, stats: Optional["CallStats"]) -> float:
 def deadline_priority(
     answer: float, accept: float, value_norm: float, hours_left: float, days_waiting: int
 ) -> tuple[float, float]:
-    """Return (score, urgency_mode). Starvation guard applied here."""
+    """Return (score, urgency_mode).
+
+    Ethics: money is the LEAST factor. Treatment value only nudges the score by
+    ±10% (a tiebreaker), never a driver — we do not prioritise patients by how
+    profitable their treatment is. Who will actually take the slot (answer ×
+    accept) and fairness (waiting time → starvation guard) dominate.
+    """
     urgency = max(0.0, min(1.0, (24.0 - hours_left) / 24.0))
-    score = (answer ** (1 + urgency)) * accept * (value_norm ** (1 - 0.7 * urgency))
+    score = (answer ** (1 + urgency)) * accept * (0.9 + 0.1 * value_norm)
     if days_waiting > 30:
         score *= 1.5
     return score, urgency
