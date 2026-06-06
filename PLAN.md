@@ -96,14 +96,15 @@ POST /outcome
 
 ## 5. ML & Scoring (Track A)
 
-### 5.1 Reliability model — P(answer & follow through)
-- **Dataset:** Kaggle "Medical Appointment No Shows" (joniarroba/noshowappointments, `KaggleV2-May-2016.csv`, ~110k rows, Brazil 2016).
-- **Features:** Age, lead_days (AppointmentDay − ScheduledDay, clipped ≥0), SMS_received, Hipertension, Diabetes, Scholarship. Drop Age<0 or >110.
-- **Model:** LightGBM (n_estimators=200, max_depth=4, class_weight="balanced") wrapped in `CalibratedClassifierCV(method="isotonic", cv=3)`.
-- **Metric:** report ROC-AUC (expect ~0.72–0.75). NEVER report accuracy (80% base rate makes it meaningless). AUC > 0.9 ⇒ label leakage, debug.
-- **Save:** `ml/reliability_model.pkl`, AUC in README.
-- **Bonus row (30 min, optional):** benchmark TabPFN **v2** (`pip install tabpfn`, subsample 8k rows, in-context learning, no training). License note: use v2 only (Apache-2.0 + attribution); TabPFN-3/2.5/2.6 licenses forbid commercial use and conflict with the hackathon IP terms. Put LightGBM-vs-TabPFN AUC table in README.
-- **Honesty caveat for README:** Brazilian public-health data; demonstrates the approach, a real deployment retrains on the practice's own history.
+### 5.1 Reliability model — P(answer & follow through)  ✅ implemented
+- **Dataset:** Kaggle "Medical Appointment No Shows" (joniarroba/noshowappointments, `KaggleV2-May-2016.csv`, 110,521 rows after dropping Age<0/>110, Brazil 2016). Committed under `data/kaggle/`.
+- **Baseline features:** Age, lead_days (AppointmentDay − ScheduledDay, clipped ≥0), SMS_received, Hipertension, Diabetes, Scholarship.
+- **Reconstructed history features (the real lift):** the raw file has no attendance column, but repeat `PatientId`s let us rebuild each patient's past behaviour — **leakage-safe** (strictly earlier appointments), trailing-5 to mirror our live last-5 `attendance_history`: `prior_no_show_rate` (Bayesian-smoothed toward the base rate), `prior_visits`, `is_first_visit`, plus `same_day`. `base_rate`+`alpha` travel in the model bundle so serving reproduces the feature exactly (no train/serve skew).
+- **Model:** LightGBM (max_depth=4, lr=0.05, class_weight="balanced", early-stopping on val) + isotonic calibration. **Split: 60/20/20 train/val/test, stratified.**
+- **Result:** held-out **test ROC-AUC = 0.742** (train 0.755 / val 0.740). Ablation: baseline-6 = 0.729 → +attendance = 0.744 (**+0.015 AUC**, 5-fold CV). NEVER accuracy (20% base rate makes it meaningless). AUC>0.9 ⇒ leakage — we're well under.
+- **Benchmark (`ml/benchmark.py`):** LightGBM ≈ XGBoost (0.744) > RandomForest (0.737) > AdaBoost (0.731) — model choice is within noise; the features are the lever. (TabPFN v2 bonus still optional.)
+- **Artifacts:** `ml/reliability_model.pkl`, `ml/metrics.json`, `ml/benchmark.json`, model card `ml/MODEL_CARD.md`.
+- **Honesty caveat for README:** Brazilian public-health data demonstrates the method; a real deployment retrains on the practice's own history — which *natively* supplies the attendance (and neighbourhood) signals we reconstruct/approximate here.
 
 ### 5.2 Accept score — P(accepts | answered) (rules, no data exists publicly)
 ```

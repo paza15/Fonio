@@ -1,11 +1,12 @@
-"""Benchmark reliability models with stratified K-fold cross-validation.
+"""Benchmark reliability models + feature sets with K-fold cross-validation.
 
-Compares the production model (LightGBM) against XGBoost, Random Forest, and
-AdaBoost on the Kaggle no-show data, using the SAME features as
-ml/train_reliability.py (§5.1). Reports ROC-AUC mean ± std across folds.
+Two experiments on the Kaggle no-show data (§5.1):
+  1. MODELS    — LightGBM vs XGBoost vs RandomForest vs AdaBoost on the full
+                 feature set (which booster is best?).
+  2. FEATURES  — LightGBM on baseline-6 vs baseline + reconstructed patient
+                 attendance history (does the history signal actually help?).
 
-AUC is invariant to monotonic calibration, so we benchmark the raw classifiers
-(no isotonic wrapper needed) — the ranking it produces is what we care about.
+AUC is invariant to monotonic calibration, so we benchmark raw classifiers.
 
 Run: python -m ml.benchmark            # 5-fold on the full ~110k rows
      python -m ml.benchmark 10         # 10-fold
@@ -24,7 +25,9 @@ import numpy as np
 from sklearn.ensemble import AdaBoostClassifier, RandomForestClassifier
 from sklearn.model_selection import StratifiedKFold, cross_val_score
 
-from ml.train_reliability import FEATURES, load_kaggle
+from ml.train_reliability import (
+    ALPHA, BASELINE_FEATURES, FEATURES, add_history_features, load_kaggle,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -32,9 +35,7 @@ OUT_PATH = Path("ml/benchmark.json")
 
 
 def build_models(pos_weight: float) -> dict:
-    """pos_weight = n_neg / n_pos, used to counter the ~20% no-show imbalance."""
     models = {}
-
     try:
         from lightgbm import LGBMClassifier
         models["LightGBM"] = LGBMClassifier(
@@ -43,24 +44,28 @@ def build_models(pos_weight: float) -> dict:
         )
     except ImportError:
         pass
-
     try:
         from xgboost import XGBClassifier
         models["XGBoost"] = XGBClassifier(
             n_estimators=200, max_depth=4, learning_rate=0.05,
-            subsample=0.9, colsample_bytree=0.9,
-            scale_pos_weight=pos_weight, eval_metric="auc",
-            tree_method="hist", n_jobs=-1,
+            subsample=0.9, colsample_bytree=0.9, scale_pos_weight=pos_weight,
+            eval_metric="auc", tree_method="hist", n_jobs=-1,
         )
     except ImportError:
         pass
-
     models["RandomForest"] = RandomForestClassifier(
-        n_estimators=300, max_depth=12, class_weight="balanced",
-        n_jobs=-1, random_state=42,
+        n_estimators=300, max_depth=12, class_weight="balanced", n_jobs=-1, random_state=42,
     )
     models["AdaBoost"] = AdaBoostClassifier(n_estimators=200, learning_rate=0.5, random_state=42)
     return models
+
+
+def _lgbm():
+    from lightgbm import LGBMClassifier
+    return LGBMClassifier(
+        n_estimators=200, max_depth=4, learning_rate=0.05,
+        class_weight="balanced", verbose=-1, n_jobs=-1,
+    )
 
 
 def main():
@@ -68,52 +73,53 @@ def main():
     subsample = int(sys.argv[2]) if len(sys.argv) > 2 else None
 
     df = load_kaggle()
+    base_rate = float(df["no_show"].mean())
+    df = add_history_features(df, base_rate=base_rate, alpha=ALPHA)
     if subsample:
         df = df.sample(n=min(subsample, len(df)), random_state=42)
-    X = df[FEATURES].astype(float).values
-    y = df["no_show"].values
 
+    y = df["no_show"].values
     pos = y.mean()
     pos_weight = (1 - pos) / pos
-    print(f"rows: {len(df):,}   no-show base rate: {pos:.1%}   "
-          f"scale_pos_weight≈{pos_weight:.2f}")
-    print(f"features: {FEATURES}")
-    print(f"cross-validation: stratified {k}-fold (shuffle, seed=42)\n")
-
     cv = StratifiedKFold(n_splits=k, shuffle=True, random_state=42)
-    models = build_models(pos_weight)
+    print(f"rows: {len(df):,}   no-show base rate: {pos:.1%}   "
+          f"cross-validation: stratified {k}-fold\n")
 
-    results = []
-    for name, model in models.items():
+    # --- experiment 1: models on the full feature set ---
+    print(f"[1] MODELS on full feature set ({len(FEATURES)} features)")
+    X_full = df[FEATURES].astype(float).values
+    model_results = []
+    for name, model in build_models(pos_weight).items():
         t0 = time.time()
-        scores = cross_val_score(model, X, y, cv=cv, scoring="roc_auc", n_jobs=1)
-        dt = time.time() - t0
-        results.append({
-            "model": name,
-            "auc_mean": float(scores.mean()),
-            "auc_std": float(scores.std()),
-            "folds": [round(float(s), 4) for s in scores],
-            "seconds": round(dt, 1),
-        })
-        print(f"{name:14s} AUC {scores.mean():.4f} ± {scores.std():.4f}   "
-              f"folds={[round(float(s),3) for s in scores]}   ({dt:.1f}s)")
+        s = cross_val_score(model, X_full, y, cv=cv, scoring="roc_auc", n_jobs=1)
+        model_results.append({"model": name, "auc_mean": float(s.mean()), "auc_std": float(s.std())})
+        print(f"    {name:14s} AUC {s.mean():.4f} ± {s.std():.4f}   ({time.time()-t0:.1f}s)")
+    model_results.sort(key=lambda r: r["auc_mean"], reverse=True)
 
-    results.sort(key=lambda r: r["auc_mean"], reverse=True)
-    print("\n=== ranking (mean ROC-AUC, {}-fold) ===".format(k))
-    for i, r in enumerate(results, 1):
-        print(f"  {i}. {r['model']:14s} {r['auc_mean']:.4f} ± {r['auc_std']:.4f}")
+    # --- experiment 2: feature ablation (does attendance history help?) ---
+    print(f"\n[2] FEATURE ABLATION (LightGBM)")
+    feature_sets = {
+        "baseline (6)": BASELINE_FEATURES,
+        "+ attendance history (10)": FEATURES,
+    }
+    feat_results = []
+    for label, feats in feature_sets.items():
+        X = df[feats].astype(float).values
+        s = cross_val_score(_lgbm(), X, y, cv=cv, scoring="roc_auc", n_jobs=1)
+        feat_results.append({"features": label, "n_features": len(feats),
+                             "auc_mean": float(s.mean()), "auc_std": float(s.std())})
+        print(f"    {label:28s} AUC {s.mean():.4f} ± {s.std():.4f}")
+    lift = feat_results[1]["auc_mean"] - feat_results[0]["auc_mean"]
+    print(f"    --> attendance-history lift: {lift:+.4f} AUC")
 
     OUT_PATH.write_text(json.dumps({
-        "cv": f"stratified-{k}-fold",
-        "n": int(len(df)),
-        "base_rate": float(pos),
-        "features": FEATURES,
-        "results": results,
+        "cv": f"stratified-{k}-fold", "n": int(len(df)), "base_rate": float(pos),
+        "models": model_results, "feature_ablation": feat_results,
+        "attendance_lift": float(lift),
     }, indent=2))
     print(f"\nSaved {OUT_PATH}")
-    best = results[0]
-    print(f"Best: {best['model']} ({best['auc_mean']:.4f}). "
-          f"Production model is LightGBM (see ml/train_reliability.py).")
+    print(f"Best model: {model_results[0]['model']} ({model_results[0]['auc_mean']:.4f}); "
+          f"production = LightGBM + full features.")
 
 
 if __name__ == "__main__":
