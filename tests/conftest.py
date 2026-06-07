@@ -3,11 +3,19 @@ how pytest is invoked, and provide shared fixtures/builders."""
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Deterministic test environment: keep the call window open (recovery threads dial
+# regardless of wall-clock) and DON'T spawn the background reaper loop — reaper
+# tests call orchestrator.reap_orphans() directly so timing is explicit.
+os.environ.setdefault("CALL_WINDOW_START", "00:00")
+os.environ.setdefault("CALL_WINDOW_END", "23:59")
+os.environ.setdefault("ORCHESTRATOR_WATCHDOG", "false")
 
 from backend.scoring import Patient, Slot  # noqa: E402
 

@@ -30,8 +30,9 @@ class _State:
     def __init__(self):
         self.lock = threading.RLock()
         self.recovery: Optional[CurrentRecovery] = None
-        self.pending_calls: dict[str, dict] = {}  # fonio_call_id → {slot_id,patient_id}
-        self.webhook_events: dict[str, dict] = {}  # fonio_call_id → outcome dict
+        # keyed by our generated call_attempt_id (fonio returns no call id):
+        self.pending_calls: dict[str, dict] = {}  # call_attempt_id → {slot_id,patient_id,to_number}
+        self.webhook_events: dict[str, dict] = {}  # call_attempt_id → outcome payload
         self.time_to_fill_seconds: list[float] = []
 
     def clear_recovery(self):

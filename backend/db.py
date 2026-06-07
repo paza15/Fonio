@@ -55,12 +55,17 @@ CREATE TABLE IF NOT EXISTS slots (
 );
 
 -- UNIQUE(slot_id) = idempotency guard against duplicate cancel events.
+-- leased_until = the reaper's lease: a live recovery renews it; if it expires
+-- while status is still 'in_progress', the slot is an orphan (the worker crashed
+-- or the process restarted) and the watchdog re-drives it. No more bricked slots.
 CREATE TABLE IF NOT EXISTS recovery_attempts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slot_id INTEGER NOT NULL UNIQUE,
     created_at TEXT NOT NULL,
     status TEXT NOT NULL,
     filled_by_patient_id INTEGER,
+    leased_until TEXT,
+    redrive_count INTEGER NOT NULL DEFAULT 0,  -- reaper re-drives; bounded so a never-answering number can't loop forever (each re-drive is a billed call)
     FOREIGN KEY(slot_id) REFERENCES slots(id),
     FOREIGN KEY(filled_by_patient_id) REFERENCES patients(id)
 );
@@ -71,6 +76,7 @@ CREATE TABLE IF NOT EXISTS calls (
     recovery_attempt_id INTEGER,
     patient_id INTEGER,
     slot_id INTEGER,
+    to_number TEXT,                 -- persisted so a post-call webhook can correlate AFTER a restart (not only via in-memory STATE.pending_calls)
     direction TEXT NOT NULL,
     outcome TEXT,
     summary TEXT,
@@ -79,6 +85,25 @@ CREATE TABLE IF NOT EXISTS calls (
     FOREIGN KEY(recovery_attempt_id) REFERENCES recovery_attempts(id),
     FOREIGN KEY(patient_id) REFERENCES patients(id),
     FOREIGN KEY(slot_id) REFERENCES slots(id)
+);
+
+-- Dead-letter store: a post-call webhook we could NOT correlate to a call is
+-- acknowledged with 200 (so fonio's at-least-once retry doesn't storm) and parked
+-- here for inspection / manual replay, rather than dropped with a 400.
+CREATE TABLE IF NOT EXISTS dead_letters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    received_at TEXT NOT NULL,
+    reason TEXT,
+    payload TEXT NOT NULL
+);
+
+-- Idempotency dedup store: at-least-once webhook delivery means the same
+-- post-call event can arrive twice. event_key (e.g. "postcall:<call_attempt_id>")
+-- is the PK; INSERT OR IGNORE distinguishes first delivery from a duplicate.
+CREATE TABLE IF NOT EXISTS processed_events (
+    event_key TEXT PRIMARY KEY,
+    kind TEXT,
+    received_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_slots_status ON slots(status);
@@ -92,6 +117,11 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA journal_mode = WAL")
+    # Explicit, tuned write-wait: WAL allows concurrent readers, but a second
+    # writer hitting a write lock would otherwise contend. 5000ms makes writers
+    # serialize (block, then proceed) instead of risking a 'database is locked'
+    # error under the two-patients-one-slot race / webhook retries.
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

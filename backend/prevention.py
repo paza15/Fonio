@@ -81,7 +81,8 @@ def confirm_slot(slot_id: int, patient) -> str:
         return "noanswer"
     repo.log_call(
         fonio_call_id=tr.fonio_call_id, recovery_attempt_id=None, patient_id=patient.id,
-        slot_id=slot_id, direction="confirmation", outcome=None, summary=None)
+        slot_id=slot_id, to_number=patient.phone, direction="confirmation",
+        outcome=None, summary=None)
     out = _wait_confirmation(tr.fonio_call_id, CONFIRM_TIMEOUT_S)
     repo.update_call_outcome(tr.fonio_call_id, out, "")
     return out
